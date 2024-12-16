@@ -1,0 +1,147 @@
+#############################################
+# Example R Code for NHANES Fatty Acids and Kidney Stones Analysis
+# This code is more complex and includes:
+# 1. Data reading and preprocessing
+# 2. Multiple imputation of missing data
+# 3. Complex survey design
+# 4. Main logistic regression
+# 5. Interaction (subgroup) analysis
+# 6. Nonlinear relationship fitting (e.g., GAM or restricted cubic splines)
+# 7. Sensitivity analyses (e.g., adding sodium, animal protein, vitamin C)
+# 8. Code to produce tables and figures
+# NOTE: Adapt variable names to your dataset.
+#############################################
+
+# Load necessary packages
+library(survey)
+library(mice)
+library(dplyr)
+library(ggplot2)
+library(mgcv)   # for GAM smoothing
+library(splines)
+library(mitools) # For combining MI results
+library(broom)
+
+# Step 1: Read and prepare data
+# Replace with actual file name or code to read NHANES data
+# nhanes_data <- read.csv("nhanes_merged_data.csv")
+
+# Ensure key variables:
+# kidney_stones (binary outcome), fatty_acid_intake (continuous, g/day),
+# total_energy (kcal), age, sex, BMI, diabetes, etc.
+
+# Step 2: Multiple Imputation
+# Identify missing data patterns
+md.pattern(nhanes_data)  
+# Impute using mice (predictive mean matching)
+m <- 10 # number of imputations
+imputed_data <- mice(nhanes_data, m = m, method = 'pmm', maxit = 5, seed = 123)
+
+# Create a list of completed datasets
+imputed_list <- lapply(1:m, function(i) complete(imputed_data, i))
+
+# Step 3: Complex Survey Design for Each Imputed Dataset
+# Suppose design variables: wtsaf = survey weight, sdmvstra = strata, sdmvpsu = psu
+survey_list <- lapply(imputed_list, function(df) {
+  svydesign(id = ~sdmvpsu, strata = ~sdmvstra, weights = ~wtsaf, data = df, nest=TRUE)
+})
+
+# Step 4: Main logistic regression model
+# Main model (no nonlinear terms, just linear)
+# Include total_energy, adjusting interpretation as discussed
+fit_list <- lapply(survey_list, function(d) {
+  svyglm(kidney_stones ~ fatty_acid_intake/10 + total_energy + age + sex + BMI + diabetes + 
+           race + education + smoking + alcohol + hypertension + HDL + total_chol + 
+           PIR + physical_activity + water_intake + protein_intake + calcium_supp,
+         design = d, family = quasibinomial())
+})
+
+# Combine results using Rubin's rules
+MI_main <- MIcombine(fit_list)
+summary(MI_main)
+exp(coef(MI_main)) # Odds ratios
+exp(confint(MI_main)) # 95% CIs
+
+# Step 5: Interaction and Subgroup Analyses
+# For example, test interaction with diabetes
+fit_int_list <- lapply(survey_list, function(d) {
+  svyglm(kidney_stones ~ I(fatty_acid_intake/10)*diabetes + total_energy + age + sex + BMI + ...,
+         design = d, family = quasibinomial())
+})
+MI_int <- MIcombine(fit_int_list)
+summary(MI_int)
+
+# Extract interaction p-values
+interaction_term <- grep("fatty_acid_intake:diabetes", names(coef(MI_int)), value = TRUE)
+cat("Interaction estimate and CI:", coef(MI_int)[interaction_term], confint(MI_int)[interaction_term,])
+
+# Subgroup analysis by diabetes status (e.g. stratified models)
+fit_subgroup_list_no_diab <- lapply(survey_list, function(d) {
+  svyglm(kidney_stones ~ I(fatty_acid_intake/10) + total_energy + age + sex + BMI + ...,
+         subset=(d$variables$diabetes==0), design = d, family=quasibinomial())
+})
+MI_sub_no_diab <- MIcombine(fit_subgroup_list_no_diab)
+
+fit_subgroup_list_diab <- lapply(survey_list, function(d) {
+  svyglm(kidney_stones ~ I(fatty_acid_intake/10) + total_energy + age + sex + BMI + ...,
+         subset=(d$variables$diabetes==1), design = d, family=quasibinomial())
+})
+MI_sub_diab <- MIcombine(fit_subgroup_list_diab)
+
+# Step 6: Nonlinear Relationship - Using Splines or GAM
+# Example using restricted cubic splines with 3 knots
+fit_nonlinear_list <- lapply(survey_list, function(d) {
+  svyglm(kidney_stones ~ ns(fatty_acid_intake, df=3) + total_energy + age + sex + ...,
+         design = d, family=quasibinomial())
+})
+MI_nonlinear <- MIcombine(fit_nonlinear_list)
+summary(MI_nonlinear)
+
+# For GAM:
+fit_gam_list <- lapply(survey_list, function(d) {
+  svygam(kidney_stones ~ s(fatty_acid_intake) + total_energy + age + sex + ...,
+         design = d, family=quasibinomial())
+})
+# Note: svygam might need workaround, or use mgcv with pweights approximations.
+# Alternatively, fit gam separately and interpret cautiously.
+
+# Step 7: Sensitivity Analyses
+# Include sodium, animal_protein, vitaminC if available
+fit_sens_list <- lapply(survey_list, function(d) {
+  svyglm(kidney_stones ~ I(fatty_acid_intake/10) + total_energy + age + sex + BMI + 
+           sodium + animal_protein + vitaminC + ...,
+         design = d, family=quasibinomial())
+})
+MI_sens <- MIcombine(fit_sens_list)
+summary(MI_sens)
+
+# Compare estimates from main model and sensitivity model
+
+# Step 8: Exporting Results
+# Extract coefficients and create a summary table
+main_res <- cbind(Estimate=coef(MI_main), CI=confint(MI_main), OR=exp(coef(MI_main)), OR_CI=exp(confint(MI_main)))
+write.csv(main_res, "main_results.csv", row.names=TRUE)
+
+# Example plot for nonlinear relationship
+# Prediction grid
+fa_grid <- data.frame(fatty_acid_intake=seq(min(nhanes_data$fatty_acid_intake, na.rm=TRUE),
+                                            max(nhanes_data$fatty_acid_intake, na.rm=TRUE), length=100),
+                      total_energy=mean(nhanes_data$total_energy, na.rm=TRUE),
+                      age=mean(nhanes_data$age, na.rm=TRUE),
+                      sex="Male", # assume binary, adapt as necessary
+                      BMI=mean(nhanes_data$BMI, na.rm=TRUE),
+                      ...)
+
+# For each imputed dataset: predict and average
+pred_list <- lapply(1:m, function(i) {
+  df_i <- imputed_list[[i]]
+  des_i <- svydesign(id=~sdmvpsu, strata=~sdmvstra, weights=~wtsaf, data=df_i, nest=TRUE)
+  fit_i <- svyglm(kidney_stones ~ ns(fatty_acid_intake, df=3) + ...,
+                  design=des_i, family=quasibinomial())
+  predict(fit_i, newdata=fa_grid, type="response")
+})
+fa_grid$predicted <- rowMeans(do.call(cbind, pred_list))
+ggplot(fa_grid, aes(x=fatty_acid_intake, y=predicted)) + geom_line() + theme_minimal() +
+  labs(x="Fatty Acid Intake (g/day)", y="Predicted Probability of Kidney Stones")
+
+#############################################
